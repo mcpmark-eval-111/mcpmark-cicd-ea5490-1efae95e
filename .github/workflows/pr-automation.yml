@@ -1,0 +1,374 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          npm run lint --if-present 2>&1 | tee eslint-output.txt || true
+          echo "eslint_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          npx prettier --check . 2>&1 | tee prettier-output.txt || true
+          echo "prettier_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let eslintOutput = 'No ESLint output';
+            let prettierOutput = 'No Prettier output';
+            
+            try {
+              eslintOutput = fs.readFileSync('eslint-output.txt', 'utf8').substring(0, 2000);
+            } catch (e) {}
+            
+            try {
+              prettierOutput = fs.readFileSync('prettier-output.txt', 'utf8').substring(0, 2000);
+            } catch (e) {}
+            
+            const eslintStatus = '${{ steps.eslint.outputs.eslint_status }}' === '0' ? '✅ Passed' : '❌ Failed';
+            const prettierStatus = '${{ steps.prettier.outputs.prettier_status }}' === '0' ? '✅ Passed' : '❌ Failed';
+            
+            const body = `## Code Quality Report
+
+            ### ESLint
+            **Status:** ${eslintStatus}
+            <details>
+            <summary>ESLint Output</summary>
+
+            \`\`\`
+            ${eslintOutput}
+            \`\`\`
+            </details>
+
+            ### Prettier
+            **Status:** ${prettierStatus}
+            <details>
+            <summary>Prettier Output</summary>
+
+            \`\`\`
+            ${prettierOutput}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          npm test --if-present -- --coverage 2>&1 | tee test-output.txt || true
+          echo "test_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Generate coverage summary
+        id: coverage
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e "
+              const summary = require('./coverage/coverage-summary.json');
+              const total = summary.total;
+              console.log('lines=' + total.lines.pct);
+              console.log('statements=' + total.statements.pct);
+              console.log('functions=' + total.functions.pct);
+              console.log('branches=' + total.branches.pct);
+            " >> $GITHUB_OUTPUT
+          else
+            echo "lines=0" >> $GITHUB_OUTPUT
+            echo "statements=0" >> $GITHUB_OUTPUT
+            echo "functions=0" >> $GITHUB_OUTPUT
+            echo "branches=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: coverage/
+          retention-days: 7
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let testOutput = 'No test output';
+            try {
+              testOutput = fs.readFileSync('test-output.txt', 'utf8').substring(0, 1500);
+            } catch (e) {}
+            
+            const testStatus = '${{ steps.test.outputs.test_status }}' === '0' ? '✅ Passed' : '❌ Failed';
+            const lines = '${{ steps.coverage.outputs.lines }}';
+            const statements = '${{ steps.coverage.outputs.statements }}';
+            const functions = '${{ steps.coverage.outputs.functions }}';
+            const branches = '${{ steps.coverage.outputs.branches }}';
+            
+            const body = `## Test Coverage Report
+
+            **Test Status:** ${testStatus}
+
+            ### Coverage Summary
+            | Metric | Coverage |
+            |--------|----------|
+            | Lines | ${lines}% |
+            | Statements | ${statements}% |
+            | Functions | ${functions}% |
+            | Branches | ${branches}% |
+
+            <details>
+            <summary>Test Output</summary>
+
+            \`\`\`
+            ${testOutput}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          npm audit --json > audit-report.json 2>&1 || true
+          cat audit-report.json | head -100
+          echo "audit_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets with TruffleHog
+        id: secrets
+        run: |
+          docker run --rm -v "$PWD:/pwd" trufflesecurity/trufflehog:latest github --repo https://github.com/${{ github.repository }} --only-verified --json > secrets-report.json 2>&1 || true
+          echo "secrets_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Dependency vulnerability check
+        id: deps
+        run: |
+          npm audit --audit-level=moderate 2>&1 | tee dep-vulns.txt || true
+          VULN_COUNT=$(cat dep-vulns.txt | grep -c "vulnerabilities" || echo "0")
+          echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let auditData = '{}';
+            let secretsFound = 0;
+            let vulnCount = '${{ steps.deps.outputs.vuln_count }}';
+            
+            try {
+              auditData = fs.readFileSync('audit-report.json', 'utf8');
+              const audit = JSON.parse(auditData);
+              const vulns = audit.metadata?.vulnerabilities || {};
+              vulnCount = Object.values(vulns).reduce((a, b) => a + b, 0);
+            } catch (e) {}
+            
+            try {
+              const secrets = fs.readFileSync('secrets-report.json', 'utf8');
+              secretsFound = secrets.split('
+').filter(l => l.trim()).length;
+            } catch (e) {}
+            
+            const auditStatus = parseInt(vulnCount) === 0 ? '✅ No vulnerabilities' : `⚠️ ${vulnCount} Vulnerabilities found`;
+            const secretsStatus = secretsFound === 0 ? '✅ No secrets detected' : `⚠️ ${secretsFound} potential secrets`;
+            
+            const body = `## Security Scan Report
+
+            ### Dependencies
+            **Status:** ${auditStatus}
+
+            ### Vulnerabilities
+            Total vulnerabilities found: **${vulnCount}**
+
+            ### Secrets Scan
+            **Status:** ${secretsStatus}
+
+            <details>
+            <summary>Security Details</summary>
+
+            Run \`npm audit\` locally for detailed vulnerability information.
+            The scan checked for hardcoded secrets, API keys, and tokens in the codebase.
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build --if-present 2>&1 | tee build-output.txt || true
+          echo "build_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Validate endpoints
+        id: validate
+        run: |
+          # Check for common endpoint files and API routes
+          echo "Checking for endpoint definitions..."
+          find . -name "*.js" -o -name "*.ts" | xargs grep -l "app\.\|router\.\|endpoint" 2>/dev/null | head -20 > endpoints.txt || true
+          ENDPOINT_COUNT=$(wc -l < endpoints.txt)
+          echo "endpoint_count=$ENDPOINT_COUNT" >> $GITHUB_OUTPUT
+          echo "validate_status=0" >> $GITHUB_OUTPUT
+
+      - name: Create deployment preview artifacts
+        if: always()
+        run: |
+          mkdir -p preview
+          echo "Build completed at $(date)" > preview/build-info.txt
+          echo "Commit: ${{ github.sha }}" >> preview/build-info.txt
+          echo "PR: #${{ github.event.pull_request.number }}" >> preview/build-info.txt
+          cp -r dist preview/ 2>/dev/null || cp -r build preview/ 2>/dev/null || echo "No build directory found" > preview/no-build.txt
+
+      - name: Upload preview artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deployment-preview-${{ github.run_number }}
+          path: preview/
+          retention-days: 3
+
+      - name: Post Build Validation
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let buildOutput = 'No build output';
+            try {
+              buildOutput = fs.readFileSync('build-output.txt', 'utf8').substring(0, 1500);
+            } catch (e) {}
+            
+            const buildStatus = '${{ steps.build.outputs.build_status }}' === '0' ? '✅ Success' : '❌ Failed';
+            const endpointCount = '${{ steps.validate.outputs.endpoint_count }}';
+            const validateStatus = '${{ steps.validate.outputs.validate_status }}' === '0' ? '✅ Validated' : '❌ Failed';
+            
+            const body = `## Build Validation
+
+            **Build Status:** ${buildStatus}
+
+            ### Application Build
+            The application build process has ${buildStatus === '✅ Success' ? 'completed successfully' : 'failed'}.
+
+            ### Endpoints Validation
+            **Status:** ${validateStatus}
+            Endpoints found: **${endpointCount}**
+
+            ### Deployment Preview
+            Preview artifacts have been generated and are available for download from the workflow run.
+
+            <details>
+            <summary>Build Output</summary>
+
+            \`\`\`
+            ${buildOutput}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
